@@ -4,7 +4,7 @@
 
 ;; Author: Svend Sorensen <svend@svends.net>
 ;; Maintainer: Tino Calancha <tino.calancha@gmail.com>
-;; Version: 2.1.4
+;; Version: 2.1.5
 ;; URL: https://www.passwordstore.org/
 ;; Package-Requires: ((emacs "25") (s "1.9.0") (with-editor "2.5.11") (auth-source-pass "5.0.0"))
 ;; Keywords: tools pass password password-store
@@ -32,7 +32,7 @@
 ;; http://www.passwordstore.org/
 
 ;;; Code:
-
+(require 'seq)
 (require 'with-editor)
 (require 'auth-source-pass)
 
@@ -59,12 +59,24 @@
   :group 'password-store
   :type 'string)
 
-(defvar password-store-executable
-  (executable-find "pass")
-  "Pass executable.")
+(defcustom password-store-hide-password t
+  "Whether to use `password-store-hidden' to hide passwords in pass files."
+  :type 'boolean)
+
+(defcustom password-store-executable (executable-find "pass")
+  "Pass executable."
+  :group 'password-store
+  :type '(file :must-match t))
 
 (defvar password-store-timeout-timer nil
   "Timer for clearing clipboard.")
+
+
+(defvar password-store-process nil "The pass process if running.")
+
+(defvar password-store-entry nil "The pass entry being edited if any.")
+
+(setq password-store-last-copied nil)
 
 (defun password-store-timeout ()
   "Number of seconds to wait before clearing the password.
@@ -94,29 +106,28 @@ or outputs error message on failure."
                   ((eq (process-status process) 'run) (accept-process-output process))
                   (t (error (concat "password-store: " state))))))))
 
+(defun password-store--cmd (args)
+  "Create shell command from list ARGS."
+  (string-join (seq-map #'shell-quote-argument (cons password-store-executable (seq-filter #'identity args))) " "))
+
 (defun password-store--run (&rest args)
   "Run pass with ARGS.
 
 Nil arguments are ignored.  Returns the output on success, or
 outputs error message on failure."
-  (let ((output nil)
-        (slept-for 0))
-    (apply #'password-store--run-1 (lambda (password)
-                                     (setq output password))
-           (delq nil args))
-    (while (not output)
-      (sleep-for .1))
-    output))
+  (shell-command-to-string (password-store--cmd args)))
+
 
 (defun password-store--run-async (&rest args)
-  "Run pass asynchronously with ARGS.
+  "Run pass asynchronously for ENTRY.
 
 Nil arguments are ignored.  Output is discarded."
-  (let ((args (mapcar #'shell-quote-argument args)))
-    (with-editor-async-shell-command
-     (mapconcat 'identity
-                (cons password-store-executable
-                      (delq nil args)) " "))))
+  (when (process-live-p password-store-process)
+    (user-error "Process pass already running"))
+  (let* ((command (password-store--cmd args))
+         (buffer (get-buffer-create "*pass*")))
+    (with-editor
+      (setq password-store-process (start-process-shell-command "pass" buffer command)))))
 
 (defun password-store--run-init (gpg-ids &optional folder)
   (apply 'password-store--run "init"
@@ -141,8 +152,8 @@ Nil arguments are ignored.  Output is discarded."
   (error "Not implemented"))
 
 (defun password-store--run-edit (entry)
-  (password-store--run-async "edit"
-                             entry))
+  (setq password-store-entry entry)
+  (password-store--run-async "edit" entry))
 
 (defun password-store--run-generate (entry password-length &optional force no-symbols)
   (password-store--run "generate"
@@ -208,7 +219,7 @@ ENTRY is the name of a password-store entry."
 (defun password-store-read-field (entry)
   "Read a field in the minibuffer, with completion for ENTRY."
   (let* ((inhibit-message t)
-         (valid-fields (mapcar #'car (password-store-parse-entry entry))))
+         (valid-fields (seq-map #'car (password-store-parse-entry entry))))
     (completing-read "Field: " valid-fields nil 'match)))
 
 (defun password-store-list (&optional subdir)
@@ -216,8 +227,8 @@ ENTRY is the name of a password-store entry."
   (unless subdir (setq subdir ""))
   (let ((dir (expand-file-name subdir (password-store-dir))))
     (if (file-directory-p dir)
-        (delete-dups
-         (mapcar 'password-store--file-to-entry
+        (seq-uniq
+         (seq-map #'password-store--file-to-entry
                  (directory-files-recursively dir ".+\\.gpg\\'"))))))
 
 ;;;###autoload
@@ -227,91 +238,44 @@ ENTRY is the name of a password-store entry."
   (password-store--run-edit entry))
 
 ;;;###autoload
-(defun password-store-get (entry &optional callback)
-  "Return password for ENTRY.
+(defun password-store-get (entry &optional field)
+  "Return FIELD for ENTRY, defaults to password is field is nil.
 
-Returns the first line of the password data.
-When CALLBACK is non-`NIL', call CALLBACK with the first line instead."
-  (let* ((inhibit-message t)
-         (secret (auth-source-pass-get 'secret entry)))
-    (if (not callback) secret
-      (password-store--run-show
-       entry
-       (lambda (_) (funcall callback secret))))))
+Returns the first line of the password data."
+  (auth-source-pass-get (or field 'secret) entry))
 
 ;;;###autoload
-(defun password-store-get-field (entry field &optional callback)
-  "Return FIELD for ENTRY.
-FIELD is a string, for instance \"url\". 
-When CALLBACK is non-`NIL', call it with the line associated to FIELD instead.
-If FIELD equals to symbol secret, then this function reduces to `password-store-get'."
-  (let* ((inhibit-message t)
-         (secret (auth-source-pass-get field entry)))
-    (if (not callback) secret
-      (password-store--run-show
-       entry
-       (lambda (_) (and secret (funcall callback secret)))))))
-
-
-;;;###autoload
-(defun password-store-clear (&optional field)
-  "Clear secret in the kill ring.
-
-Optional argument FIELD, a symbol or a string, describes
-the stored secret to clear; if nil, then set it to 'secret.
-Note, FIELD does not affect the function logic; it is only used
-to display the message:
-
-\(message \"Field %s cleared.\" field)."
+(defun password-store-clear ()
+  "Clear secret in the kill ring."
   (interactive "i")
-  (unless field (setq field 'secret))
-  (when password-store-timeout-timer
-    (cancel-timer password-store-timeout-timer)
-    (setq password-store-timeout-timer nil))
-  (when password-store-kill-ring-pointer
-    (setcar password-store-kill-ring-pointer "")
-    (setq password-store-kill-ring-pointer nil)
-    (message "Field %s cleared." field)))
-
-(defun password-store--save-field-in-kill-ring (entry secret field)
-  (password-store-clear field)
-  (kill-new secret)
-  (setq password-store-kill-ring-pointer kill-ring-yank-pointer)
-  (message "Copied %s for %s to the kill ring. Will clear in %s seconds."
-           field entry password-store-time-before-clipboard-restore)
-  (setq password-store-timeout-timer
-        (run-at-time password-store-time-before-clipboard-restore nil
-                     (lambda () (funcall #'password-store-clear field)))))
+  (when password-store-last-copied
+    (seq-let (pointer timer field) password-store-last-copied
+      (setcar pointer "")
+      ;; Remove it from the system clipboard
+      (gui-select-text "")
+      (cancel-timer timer)
+      (message "Password store field %s removed from kill ring." field))
+    (setq password-store-last-copied nil)))
 
 ;;;###autoload
-(defun password-store-copy (entry)
+(defun password-store-copy (entry &optional field)
   "Add password for ENTRY into the kill ring.
 
 Clear previous password from the kill ring.  Pointer to the kill ring
 is stored in `password-store-kill-ring-pointer'.  Password is cleared
 after `password-store-time-before-clipboard-restore' seconds."
-  (interactive (list (password-store--completing-read t)))
-  (password-store-get
-   entry
-   (lambda (password)
-     (password-store--save-field-in-kill-ring entry password 'secret))))
-
-;;;###autoload
-(defun password-store-copy-field (entry field)
-  "Add FIELD for ENTRY into the kill ring.
-
-Clear previous secret from the kill ring.  Pointer to the kill ring is
-stored in `password-store-kill-ring-pointer'.  Secret field is cleared
-after `password-store-timeout' seconds.
-If FIELD equals to symbol secret, then this function reduces to `password-store-copy'."
   (interactive
-   (let ((entry (password-store--completing-read)))
-     (list entry (password-store-read-field entry))))
-  (password-store-get-field
-   entry
-   field
-   (lambda (secret-value)
-     (password-store--save-field-in-kill-ring entry secret-value field))))
+   (let* ((entry (password-store--completing-read t))
+          (field (if current-prefix-arg (password-store-read-field entry) 'secret)))
+     (list entry field)))
+  (password-store-clear)
+  (kill-new (password-store-get entry field))
+  (let ((pointer kill-ring-yank-pointer)
+        (timer (run-at-time password-store-time-before-clipboard-restore nil #'password-store-clear)))
+    (setq password-store-last-copied (list pointer timer field)))
+  (message "Password store copied %s for %s to the kill ring for %s seconds."
+           field entry password-store-time-before-clipboard-restore))
+
 
 ;;;###autoload
 (defun password-store-init (gpg-id)
@@ -360,7 +324,7 @@ Default PASSWORD-LENGTH is `password-store-password-length'."
   (interactive (list (password-store--completing-read)
                      (and current-prefix-arg
                           (abs (prefix-numeric-value current-prefix-arg)))))
-  
+
   ;; A message with the output of the command is not printed because
   ;; the output contains the password.
   (password-store--run-generate
@@ -368,6 +332,18 @@ Default PASSWORD-LENGTH is `password-store-password-length'."
    (or password-length password-store-password-length)
    'force 'no-symbols)
   nil)
+
+;;;###autoload
+(defun password-store-create (entry &optional password-length)
+  "Generate a new password for ENTRY with PASSWORD-LENGTH and edit it.
+
+Default PASSWORD-LENGTH is `password-store-password-length'."
+  (interactive (list (password-store--completing-read)
+                     (when current-prefix-arg
+                       (abs (prefix-numeric-value current-prefix-arg)))))
+  (password-store-generate entry password-length)
+  (password-store-edit entry)
+  (password-store-copy entry))
 
 ;;;###autoload
 (defun password-store-remove (entry)
@@ -395,6 +371,73 @@ Default PASSWORD-LENGTH is `password-store-password-length'."
   (let ((url (password-store-get-field entry password-store-url-field)))
     (if url (browse-url url)
       (error "Field `%s' not found" password-store-url-field))))
+
+(defvar password-store-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c")     'with-editor-finish)
+    (define-key map (kbd "C-c C-k")     'with-editor-cancel)
+    map)
+  "Key map used by `password-store-mode'.")
+
+(defconst password-store-filename-regexp "pass\\.[a-zA-Z0-9]+/.*\\.txt$")
+
+(defun password-store-setup-check-buffer ()
+  "Check if we are opening a password store entry."
+  (and buffer-file-name
+       (string-match-p password-store-filename-regexp buffer-file-name)
+       (password-store-mode)))
+
+(defvar password-store-font-lock-keywords '(("\n\\([^\n:]+:\\)" 1 font-lock-variable-name-face)))
+
+(defun password-store--toggle-display (overlay hide)
+  (if hide
+      (overlay-put overlay 'display
+                   (propertize "****" 'face 'font-lock-doc-face))
+    (overlay-put overlay 'display nil)))
+
+(defun password-store--hide-password ()
+  "Hide password."
+  (save-excursion
+    (let ((overlay (make-overlay (point-min) (line-end-position))))
+      (overlay-put overlay 'display
+                   (propertize "****" 'face 'font-lock-doc-face))
+      (overlay-put overlay 'reveal-toggle-invisible
+                   #'password-store--toggle-display))))
+;;;###autoload
+(define-derived-mode password-store-mode text-mode "pass"
+  "`password-store-mode' is a major mode for Unix password manager password entries.
+
+\\{password-store-mode-map}"
+  (setq font-lock-defaults '(password-store-font-lock-keywords))
+  (rename-buffer (format "*pass %s*" password-store-entry))
+  (forward-line)
+  (when password-store-hide-password
+    (password-store--hide-password)
+    (reveal-mode))
+  ;; Delay message to hide the default emacsclient message
+  (run-at-time 0.3 nil (lambda () (message "Use C-c C-c to commit changes or C-c C-k to abort."))))
+
+(define-minor-mode global-password-store-mode
+  "Edit password store passwords.
+
+This global mode arranges for `password-store-edit-setup' to be called
+when a password file is opened.  That usually happens
+when pass uses the Emacsclient as $EDITOR to have the user
+edit the password.
+
+Loading the library `password-store' by default enables this mode."
+  :group 'password-store
+  :type 'boolean
+  :global t
+  :init-value t
+  :initialize (lambda (symbol exp)
+                (custom-initialize-default symbol exp)
+                (when global-password-store-mode
+                  (add-hook 'find-file-hook 'password-store-setup-check-buffer)))
+  (if global-password-store-mode
+      (add-hook  'find-file-hook 'password-store-setup-check-buffer)
+    (remove-hook 'find-file-hook 'password-store-setup-check-buffer)))
+
 
 
 (provide 'password-store)
