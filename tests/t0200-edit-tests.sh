@@ -14,4 +14,11 @@ test_expect_success 'Test "edit" command' '
 	[[ $("$PASS" show cred1) == "$FAKE_EDITOR_PASSWORD" ]]
 '
 
+test_expect_success 'Test "edit" command when editor fails' '
+	"$PASS" init $KEY1 &&
+	"$PASS" generate cred1 90 &&
+	export EDITOR="false" &&
+	! "$PASS" edit cred1
+'
+
 test_done

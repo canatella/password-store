@@ -500,7 +500,7 @@ cmd_edit() {
 		$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$passfile" || exit 1
 		action="Edit"
 	fi
-	${EDITOR:-vi} "$tmp_file"
+	${EDITOR:-vi} "$tmp_file" || die "Editor canceled edit."
 	[[ -f $tmp_file ]] || die "New password not saved."
 	$GPG -d -o - "${GPG_OPTS[@]}" "$passfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Password unchanged."
 	while ! $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" "$tmp_file"; do
