@@ -40,6 +40,12 @@ git_add_file() {
 	[[ -n $(git -C "$INNER_GIT_DIR" status --porcelain "$1") ]] || return
 	git_commit "$2"
 }
+git_add_files() {
+	[[ -n $INNER_GIT_DIR ]] || return
+	git -C "$INNER_GIT_DIR" add "$1" "$2" || return
+	[[ -n $(git -C "$INNER_GIT_DIR" status --porcelain "$1" "$2") ]] || return
+	git_commit "$3"
+}
 git_commit() {
 	local sign=""
 	[[ -n $INNER_GIT_DIR ]] || return
@@ -381,10 +387,11 @@ cmd_show() {
 	local pass
 	local path="$1"
 	local passfile="$PREFIX/$path.gpg"
+        local yamlfile="$PREFIX/$path.yaml"
 	check_sneaky_paths "$path"
 	if [[ -f $passfile ]]; then
 		if [[ $clip -eq 0 && $qrcode -eq 0 ]]; then
-			pass="$($GPG -d "${GPG_OPTS[@]}" "$passfile" | $BASE64)" || exit $?
+			pass="$(($GPG -d "${GPG_OPTS[@]}" "$passfile" && cat $yamlfile) | $BASE64)" || exit $?
 			echo "$pass" | $BASE64 -d
 		else
 			[[ $selected_line =~ ^[0-9]+$ ]] || die "Clip location '$selected_line' is not a number."
@@ -402,7 +409,30 @@ cmd_show() {
 		else
 			echo "${path%\/}"
 		fi
-		tree -N -C -l --noreport "$PREFIX/$path" 3>&- | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' # remove .gpg at end of line, but keep colors
+		tree -N -C -l --noreport "$PREFIX/$path"  -I '*.yaml' 3>&- | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' # remove .gpg at end of line, but keep colors
+	elif [[ -z $path ]]; then
+		die "Error: password store is empty. Try \"pass init\"."
+	else
+		die "Error: $path is not in the password store."
+	fi
+}
+
+cmd_yaml() {
+        local data pass
+        data="$(cmd_show "$@")"
+        pass="$(echo "$data" | head -1 | sed s/\\\"/\\\\\"/g)"
+        echo "$data" | tail -n+2
+        echo "password: \"$pass\""
+}
+
+cmd_metadata() {
+	local pass
+	local path="$1"
+        local yamlfile="$PREFIX/$path.yaml"
+	check_sneaky_paths "$path"
+	if [[ -f $yamlfile ]]; then
+                echo "---"
+                cat "$yamlfile"
 	elif [[ -z $path ]]; then
 		die "Error: password store is empty. Try \"pass init\"."
 	else
@@ -414,7 +444,7 @@ cmd_find() {
 	[[ $# -eq 0 ]] && die "Usage: $PROGRAM $COMMAND pass-names..."
 	IFS="," eval 'echo "Search Terms: $*"'
 	local terms="*$(printf '%s*|*' "$@")"
-	tree -N -C -l --noreport -P "${terms%|*}" --prune --matchdirs --ignore-case "$PREFIX" 3>&- | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
+	tree -N -C -l --noreport -P "${terms%|*}"  -I '*.yaml' --prune --matchdirs --ignore-case "$PREFIX" 3>&- | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
 }
 
 cmd_grep() {
@@ -448,6 +478,7 @@ cmd_insert() {
 	[[ $err -ne 0 || ( $multiline -eq 1 && $noecho -eq 0 ) || $# -ne 1 ]] && die "Usage: $PROGRAM $COMMAND [--echo,-e | --multiline,-m] [--force,-f] pass-name"
 	local path="${1%/}"
 	local passfile="$PREFIX/$path.gpg"
+        local yamlfile="$PREFIX/$path.yaml"
 	check_sneaky_paths "$path"
 	set_git "$passfile"
 
@@ -479,7 +510,8 @@ cmd_insert() {
 		read -r -p "Enter password for $path: " -e password
 		echo "$password" | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" || die "Password encryption aborted."
 	fi
-	git_add_file "$passfile" "Add given password for $path to store."
+        touch "$yamlfile"
+	git_add_files "$passfile" "$yamlfile" "Add given password for $path to store."
 }
 
 cmd_edit() {
@@ -551,7 +583,9 @@ cmd_generate() {
 	fi
 	local verb="Add"
 	[[ $inplace -eq 1 ]] && verb="Replace"
-	git_add_file "$passfile" "$verb generated password for ${path}."
+        local yamlfile="$PREFIX/$path.yaml"
+        touch "$yamlfile"
+	git_add_files "$passfile" "$yamlfile" "$verb generated password for ${path}."
 
 	if [[ $clip -eq 1 ]]; then
 		clip "$pass" "$path"
@@ -578,16 +612,17 @@ cmd_delete() {
 
 	local passdir="$PREFIX/${path%/}"
 	local passfile="$PREFIX/$path.gpg"
+        local yamlfile="$PREFIX/$path.yaml"
 	[[ -f $passfile && -d $passdir && $path == */ || ! -f $passfile ]] && passfile="${passdir%/}/"
 	[[ -e $passfile ]] || die "Error: $path is not in the password store."
 	set_git "$passfile"
 
 	[[ $force -eq 1 ]] || yesno "Are you sure you would like to delete $path?"
 
-	rm $recursive -f -v "$passfile"
+	rm $recursive -f -v "$passfile" "$yamlfile"
 	set_git "$passfile"
 	if [[ -n $INNER_GIT_DIR && ! -e $passfile ]]; then
-		git -C "$INNER_GIT_DIR" rm -qr "$passfile"
+		git -C "$INNER_GIT_DIR" rm -qr "$passfile" "$yamlfile"
 		set_git "$passfile"
 		git_commit "Remove $path from store."
 	fi
@@ -707,6 +742,8 @@ case "$1" in
 	help|--help) shift;		cmd_usage "$@" ;;
 	version|--version) shift;	cmd_version "$@" ;;
 	show|ls|list) shift;		cmd_show "$@" ;;
+	yaml) shift;			cmd_yaml "$@" ;;
+	metadata) shift;		cmd_metadata "$@" ;;
 	find|search) shift;		cmd_find "$@" ;;
 	grep) shift;			cmd_grep "$@" ;;
 	insert|add) shift;		cmd_insert "$@" ;;
